@@ -45,6 +45,8 @@ tr.k14 td { background:var(--gold-bg); }
 
   <button class="go" id="refresh" type="button">Refresh rates</button>
 
+  <p class="status" id="msg" aria-live="polite"></p>
+
   <section class="card" aria-live="polite">
     <div class="scroll">
       <table>
@@ -72,7 +74,7 @@ tr.k14 td { background:var(--gold-bg); }
   </section>
 
   <p class="note">
-    Rates are collected from each shop's website every hour (9:35 AM to 9:35 PM IST) by a GitHub Action and saved in rates.json; Refresh reloads that file. Both shops publish one rate for all showrooms, so this is
+    Tapping Refresh fetches today's rates straight from each shop's website (through free public relays). If that fails, the page shows the last rates saved in rates.json, which a GitHub Action refreshes every hour. Both shops publish one rate for all showrooms, so this is
     not specific to Sangamner, and PNG's web rate is marked for online purchase only. Chandukaka does
     not list 14K: the 14K figure is estimated as 24K × 0.63. Open the sites to double-check:
     <a href="https://chandukakasaraf.in/todays-gold-rate/" target="_blank" rel="noopener">Chandukaka</a>,
@@ -82,43 +84,162 @@ tr.k14 td { background:var(--gold-bg); }
 
 <script>
 (function () {
-  var DATA_URL = 'rates.json';
+  var SITES = {
+    c: {
+      json: 'chandukaka',
+      host: 'chandukakasaraf.in',
+      url: 'https://chandukakasaraf.in/todays-gold-rate/',
+      rate: /(\d{2})\s*KT\s*Gold[^\d₹]{0,8}₹\s*([\d,]+)/g,
+      updated: /Updated\s*On:?\s*([\d\-]+\s[\d:]+)/i
+    },
+    p: {
+      json: 'png',
+      host: 'pngjewellers.com',
+      url: 'https://www.pngjewellers.com/pages/metal-rates',
+      rate: /(\d{1,2})\s*K\s*Gold[^\d₹]{0,8}₹\s*([\d,]+)/g,
+      updated: /Updated on\s*([A-Za-z]+,\s*[A-Za-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} [AP]M)/i
+    }
+  };
+  // Public relays that add the CORS header browsers need. All are tried at once; first good answer wins.
+  var PROXIES = [
+    { name: 'allorigins.win', make: function (u) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); } },
+    { name: 'corsproxy.io',   make: function (u) { return 'https://corsproxy.io/?' + encodeURIComponent(u); } },
+    { name: 'codetabs.com',   make: function (u) { return 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u); } }
+  ];
+  var FALLBACK_URL = 'rates.json';
+  var TIMEOUT_MS = 15000;
   var SRC_KEY = 'gold-rates-source';
-  function getSrc() { try { return localStorage.getItem(SRC_KEY) || ''; } catch (e) { return ''; } }
-  var KEY = 'gold-rates-live-v2';
+  var KEY = 'gold-rates-live-v3';
   var KARATS = [24, 22, 18, 14];
   var data = { c: null, p: null };
   var $ = function (id) { return document.getElementById(id); };
 
+  function getSrc() { try { return localStorage.getItem(SRC_KEY) || ''; } catch (e) { return ''; } }
   function inr(n) { return n.toLocaleString('en-IN'); }
-
   function setStatus(key, text, isErr) {
     var st = $('st-' + key);
     st.className = 'status' + (isErr ? ' err' : '');
     st.textContent = text;
   }
 
-  function load() {
-    var base = getSrc() || DATA_URL;
-    return fetch(base + (base.indexOf('?') > -1 ? '&' : '?') + 't=' + Date.now(), { cache: 'no-store' }).then(function (r) {
+  function fetchText(url) {
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, TIMEOUT_MS);
+    return fetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function (j) {
-      var ageH = (Date.now() - new Date(j.fetchedAt).getTime()) / 36e5;
-      var fetched = new Date(j.fetchedAt).toLocaleString();
-      [['c', 'chandukaka'], ['p', 'png']].forEach(function (pair) {
-        var key = pair[0], s = j[pair[1]];
-        var has = s && s.rates && Object.keys(s.rates).length;
-        if (has) data[key] = { rates: s.rates, updated: s.updated, fetchedAt: j.fetchedAt };
-        if (!has) {
-          setStatus(key, 'No rates came back from the live source.', true);
-        } else if (s.error) {
-          setStatus(key, 'Latest update failed (' + s.error + '). Showing older rates. Site said: ' + s.updated, true);
-        } else {
-          setStatus(key, 'Site says updated: ' + s.updated + '. Fetched at ' + fetched + (ageH > 8 ? ' (more than 8 hours old)' : '') + '.', ageH > 8);
-        }
+      return r.text();
+    }).then(function (t) { clearTimeout(timer); return t; }, function (e) {
+      clearTimeout(timer);
+      throw new Error(e && e.name === 'AbortError' ? 'timed out' : (e && e.message) || 'network error');
+    });
+  }
+
+  function strip(html) {
+    return html
+      .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&#8377;|&#x20B9;|&rupee;/gi, '₹')
+      .replace(/\s+/g, ' ');
+  }
+
+  function parse(text, cfg) {
+    var re = new RegExp(cfg.rate.source, 'g'), m, rates = {}, n = 0;
+    while ((m = re.exec(text))) {
+      var k = parseInt(m[1], 10);
+      if (!(k in rates)) { rates[k] = parseInt(m[2].replace(/,/g, ''), 10); n++; }
+    }
+    if (!n) return null;
+    var u = text.match(cfg.updated);
+    return { rates: rates, updated: u ? u[1] : 'time not shown on page' };
+  }
+
+  function firstValid(list) {
+    return new Promise(function (resolve, reject) {
+      var left = list.length, errs = [];
+      list.forEach(function (p) {
+        p.then(resolve, function (e) {
+          errs.push(e.message);
+          if (--left === 0) reject(new Error(errs.join('; ')));
+        });
       });
     });
+  }
+
+  // Live fetch of one shop through the public relays.
+  function liveSite(cfg) {
+    return firstValid(PROXIES.map(function (px) {
+      return fetchText(px.make(cfg.url)).then(function (html) {
+        var r = parse(strip(html), cfg);
+        if (!r) throw new Error(px.name + ': no rates in reply');
+        r.via = px.name;
+        return r;
+      }).catch(function (e) {
+        throw new Error(e.message.indexOf(px.name) === 0 ? e.message : px.name + ': ' + e.message);
+      });
+    }));
+  }
+
+  // Combined JSON from your own Cloudflare Worker or from rates.json
+  function loadJson(base) {
+    return fetchText(base + (base.indexOf('?') > -1 ? '&' : '?') + 't=' + Date.now()).then(function (t) { return JSON.parse(t); });
+  }
+
+  function getAll() {
+    var src = getSrc();
+    if (src) {
+      return loadJson(src).then(function (j) {
+        var out = { at: j.fetchedAt };
+        Object.keys(SITES).forEach(function (k) {
+          var s = j[SITES[k].json];
+          out[k] = (s && s.rates && Object.keys(s.rates).length)
+            ? { rates: s.rates, updated: s.updated, via: 'your custom link', error: s.error }
+            : { error: (s && s.error) || 'no rates returned' };
+        });
+        return out;
+      });
+    }
+    var out = { at: new Date().toISOString() };
+    return Promise.all(Object.keys(SITES).map(function (k) {
+      return liveSite(SITES[k]).then(function (r) { out[k] = r; }, function (e) { out[k] = { error: e.message }; });
+    })).then(function () {
+      var failed = Object.keys(SITES).filter(function (k) { return !out[k].rates; });
+      if (!failed.length) return out;
+      return loadJson(FALLBACK_URL).then(function (j) {
+        failed.forEach(function (k) {
+          var s = j[SITES[k].json];
+          if (s && s.rates && Object.keys(s.rates).length) {
+            out[k] = { rates: s.rates, updated: s.updated, saved: j.fetchedAt, error: out[k].error };
+          }
+        });
+        return out;
+      }, function () { return out; });
+    });
+  }
+
+  function apply(out) {
+    var when = new Date(out.at).toLocaleString();
+    Object.keys(SITES).forEach(function (k) {
+      var r = out[k];
+      if (r && r.rates) {
+        var rec = { rates: r.rates, updated: r.updated };
+        if (r.saved) {
+          rec.saved = r.saved;
+          setStatus(k, 'Live fetch failed (' + r.error + '). Showing saved rates from ' + new Date(r.saved).toLocaleString() + '. Site said: ' + r.updated, true);
+        } else if (r.error) {
+          setStatus(k, 'Latest update failed (' + r.error + '). Showing older rates. Site said: ' + r.updated, true);
+        } else {
+          setStatus(k, 'Live from ' + SITES[k].host + ' via ' + r.via + '. Site says updated: ' + r.updated + '. Fetched ' + when + '.', false);
+        }
+        data[k] = rec;
+      } else if (data[k]) {
+        setStatus(k, 'Could not fetch (' + ((r && r.error) || 'unknown error') + '). Showing the last rates this browser saw. Site said: ' + data[k].updated, true);
+      } else {
+        setStatus(k, 'Could not fetch rates (' + ((r && r.error) || 'unknown error') + '). Try Refresh again.', true);
+      }
+    });
+    $('msg').className = 'status';
+    $('msg').textContent = 'Refreshed at ' + new Date().toLocaleTimeString() + '.';
   }
 
   function rateOf(key, k) {
@@ -162,11 +283,11 @@ tr.k14 td { background:var(--gold-bg); }
 
   function refresh() {
     var btn = $('refresh');
-    btn.disabled = true; btn.textContent = 'Loading…';
-    load().catch(function (e) {
-      var msg = 'Could not load rates (' + e.message + '). ' + (getSrc() ? 'Check the saved link under Custom source.' : 'rates.json may not exist yet: run the Update gold rates workflow once in the Actions tab.');
-      setStatus('c', msg, true);
-      setStatus('p', msg, true);
+    btn.disabled = true; btn.textContent = 'Fetching live rates…';
+    $('msg').className = 'status'; $('msg').textContent = 'Contacting the shop websites, this can take up to 15 seconds.';
+    getAll().then(apply, function (e) {
+      Object.keys(SITES).forEach(function (k) { setStatus(k, 'Could not load rates (' + e.message + ').', true); });
+      $('msg').textContent = '';
     }).then(function () {
       render(); save();
       btn.disabled = false; btn.textContent = 'Refresh rates';
@@ -176,7 +297,9 @@ tr.k14 td { background:var(--gold-bg); }
   function showSrc() {
     var v = getSrc();
     $('srcUrl').value = v;
-    $('srcInfo').textContent = v ? 'Fetching live from your custom link each time you tap Refresh.' : 'Using rates.json from this site, updated hourly by GitHub Actions. To use a Cloudflare relay instead, paste its link and tap Save.';
+    $('srcInfo').textContent = v
+      ? 'Using your custom link instead of fetching the shop sites directly.'
+      : 'Not needed. Refresh fetches the shop sites directly. Paste a Cloudflare Worker link here only if the public relays stop working.';
   }
   $('srcSave').addEventListener('click', function () {
     var v = $('srcUrl').value.trim();
